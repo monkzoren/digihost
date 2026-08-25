@@ -5,12 +5,11 @@
 //! credential — the server is the only client that speaks to the control
 //! plane as an operator.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Extension, Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -34,24 +33,35 @@ const SESSION_COOKIE: &str = "digihost_session";
 
 /// Operator sessions are in memory: a restart signing everyone out is the
 /// correct behaviour for a single-tenant box, and it avoids persisting
-/// anything that grants access.
+/// anything that grants access. Each session belongs to a named user.
 #[derive(Clone, Default)]
-pub struct Sessions(Arc<RwLock<HashSet<String>>>);
+pub struct Sessions(Arc<RwLock<std::collections::HashMap<String, String>>>);
 
 impl Sessions {
-    pub async fn create(&self) -> anyhow::Result<String> {
+    pub async fn create(&self, user: &str) -> anyhow::Result<String> {
         let token = generate_token()?;
-        self.0.write().await.insert(token.clone());
+        self.0.write().await.insert(token.clone(), user.to_string());
         Ok(token)
     }
 
-    pub async fn is_valid(&self, token: &str) -> bool {
-        self.0.read().await.contains(token)
+    pub async fn user_for(&self, token: &str) -> Option<String> {
+        self.0.read().await.get(token).cloned()
     }
 
     pub async fn revoke(&self, token: &str) {
         self.0.write().await.remove(token);
     }
+}
+
+/// Who an authenticated request is. Inserted by the middleware, so every
+/// protected handler can know its caller.
+#[derive(Clone)]
+pub struct CurrentUser {
+    pub name: String,
+    pub admin: bool,
+    /// True when the request authenticated with an API token rather than a
+    /// browser session — those cannot manage accounts or change passwords.
+    pub via_token: bool,
 }
 
 fn cookie_value(req: &Request, name: &str) -> Option<String> {
@@ -65,9 +75,16 @@ fn cookie_value(req: &Request, name: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-/// Gate every operator surface. Unauthenticated browsers land on the login
-/// page; unauthenticated action calls get a 401 rather than a redirect.
-pub async fn require_operator(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// Gate every operator surface, and record who the caller is.
+///
+/// Browsers authenticate with a session cookie; scripts may use an API token
+/// as a bearer header on the action endpoints. Unauthenticated browsers land
+/// on the login page; unauthenticated action calls get a 401.
+pub async fn require_operator(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let path = req.uri().path().to_string();
 
     // First run: nobody has claimed the instance, so setup is the only page.
@@ -75,24 +92,46 @@ pub async fn require_operator(State(state): State<AppState>, req: Request, next:
         return Redirect::to("/setup").into_response();
     }
 
-    let authorised = match cookie_value(&req, SESSION_COOKIE) {
-        Some(token) => state.sessions.is_valid(&token).await,
-        None => false,
-    };
+    // Session first. Admin is looked up fresh each request, so demoting or
+    // deleting a user takes effect immediately, sessions included.
+    let mut current: Option<CurrentUser> = None;
+    if let Some(token) = cookie_value(&req, SESSION_COOKIE) {
+        if let Some(name) = state.sessions.user_for(&token).await {
+            if let Some(admin) = state.store.user_admin(&name).await {
+                current = Some(CurrentUser { name, admin, via_token: false });
+            }
+        }
+    }
+    if current.is_none() {
+        if let Some(token) = bearer(&req) {
+            if let Some(name) = state.store.api_token_name(&token).await {
+                current = Some(CurrentUser {
+                    name: format!("token:{name}"),
+                    admin: false,
+                    via_token: true,
+                });
+            }
+        }
+    }
 
-    if authorised {
-        return next.run(req).await;
+    match current {
+        Some(user) => {
+            req.extensions_mut().insert(user);
+            next.run(req).await
+        }
+        None if path.starts_with("/actions/") => {
+            (StatusCode::UNAUTHORIZED, "sign in first").into_response()
+        }
+        None => Redirect::to("/login").into_response(),
     }
-    if path.starts_with("/actions/") {
-        return (StatusCode::UNAUTHORIZED, "sign in first").into_response();
-    }
-    Redirect::to("/login").into_response()
 }
 
 // ---------------------------------------------------------------- sessions
 
 #[derive(Deserialize)]
 pub struct LoginForm {
+    #[serde(default)]
+    pub username: String,
     pub password: String,
 }
 
@@ -100,28 +139,42 @@ pub async fn setup(State(state): State<AppState>, Form(form): Form<LoginForm>) -
     if state.store.is_claimed().await {
         return Redirect::to("/login").into_response();
     }
-    if form.password.chars().count() < 12 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "choose a password of at least 12 characters",
-        )
-            .into_response();
+    if let Err(resp) = password_acceptable(&form.password) {
+        return resp;
     }
-    if let Err(e) = state.store.set_operator_password(&form.password).await {
-        return internal(e);
-    }
-    issue_session(&state).await
+    let username = if form.username.trim().is_empty() {
+        "admin".to_string()
+    } else {
+        form.username.clone()
+    };
+    // The first account claims the instance, so it is an administrator.
+    let name = match state.store.add_user(&username, &form.password, true).await {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    };
+    issue_session(&state, &name).await
 }
 
 pub async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
-    if !state.store.verify_operator(&form.password).await {
+    if state.store.verify_login(&form.username, &form.password).await.is_none() {
         return Redirect::to("/login?error=1").into_response();
     }
-    issue_session(&state).await
+    issue_session(&state, form.username.trim().to_lowercase().as_str()).await
 }
 
-async fn issue_session(state: &AppState) -> Response {
-    match state.sessions.create().await {
+fn password_acceptable(password: &str) -> Result<(), Response> {
+    if password.chars().count() < 12 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "choose a password of at least 12 characters",
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+async fn issue_session(state: &AppState, user: &str) -> Response {
+    match state.sessions.create(user).await {
         Ok(token) => (
             [(
                 header::SET_COOKIE,
@@ -526,6 +579,161 @@ pub async fn remove_host(State(state): State<AppState>, Form(form): Form<DeleteH
     }
 }
 
+// --------------------------------------------------------- users and tokens
+
+fn require_admin(user: &CurrentUser) -> Result<(), Response> {
+    if user.admin {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "administrators only").into_response())
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AddUserForm {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub admin: Option<String>,
+}
+
+pub async fn team_add(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Form(form): Form<AddUserForm>,
+) -> Response {
+    if let Err(resp) = require_admin(&user) {
+        return resp;
+    }
+    if let Err(resp) = password_acceptable(&form.password) {
+        return resp;
+    }
+    match state
+        .store
+        .add_user(&form.username, &form.password, form.admin.is_some())
+        .await
+    {
+        Ok(_) => Redirect::to("/settings/team").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ResetPasswordForm {
+    pub user: String,
+    pub password: String,
+}
+
+pub async fn team_reset(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Form(form): Form<ResetPasswordForm>,
+) -> Response {
+    if let Err(resp) = require_admin(&user) {
+        return resp;
+    }
+    if let Err(resp) = password_acceptable(&form.password) {
+        return resp;
+    }
+    match state.store.set_user_password(&form.user, &form.password).await {
+        Ok(()) => Redirect::to("/settings/team").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RemoveUserForm {
+    pub user: String,
+}
+
+pub async fn team_remove(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Form(form): Form<RemoveUserForm>,
+) -> Response {
+    if let Err(resp) = require_admin(&user) {
+        return resp;
+    }
+    if form.user.trim().to_lowercase() == user.name {
+        return (StatusCode::BAD_REQUEST, "you cannot remove your own account").into_response();
+    }
+    match state.store.remove_user(&form.user).await {
+        Ok(()) => Redirect::to("/settings/team").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordForm {
+    pub current: String,
+    pub password: String,
+}
+
+/// Any signed-in person may rotate their own password — proving the current
+/// one first, so a walked-away-from browser cannot silently take the account.
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Form(form): Form<ChangePasswordForm>,
+) -> Response {
+    if user.via_token {
+        return (StatusCode::FORBIDDEN, "API tokens cannot change passwords").into_response();
+    }
+    if state.store.verify_login(&user.name, &form.current).await.is_none() {
+        return (StatusCode::BAD_REQUEST, "the current password is wrong").into_response();
+    }
+    if let Err(resp) = password_acceptable(&form.password) {
+        return resp;
+    }
+    match state.store.set_user_password(&user.name, &form.password).await {
+        Ok(()) => (StatusCode::OK, "password changed").into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MintTokenForm {
+    pub name: String,
+}
+
+/// Mint an API token. Shown exactly once; only the hash is kept.
+pub async fn token_mint(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Form(form): Form<MintTokenForm>,
+) -> Response {
+    if let Err(resp) = require_admin(&user) {
+        return resp;
+    }
+    match state.store.mint_api_token(&form.name).await {
+        Ok(token) => (
+            StatusCode::OK,
+            format!("{token}\n\nThis token is shown once. Use it as:  Authorization: Bearer <token>"),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RevokeTokenForm {
+    pub name: String,
+}
+
+pub async fn token_revoke(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Form(form): Form<RevokeTokenForm>,
+) -> Response {
+    if let Err(resp) = require_admin(&user) {
+        return resp;
+    }
+    match state.store.revoke_api_token(&form.name).await {
+        Ok(()) => Redirect::to("/settings/tokens").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
 // ------------------------------------------------------------------- GitHub
 
 #[derive(Deserialize)]
@@ -872,12 +1080,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_validate_and_revoke() {
+    async fn sessions_belong_to_a_user_and_revoke() {
         let sessions = Sessions::default();
-        let token = sessions.create().await.unwrap();
-        assert!(sessions.is_valid(&token).await);
-        assert!(!sessions.is_valid("forged").await);
+        let token = sessions.create("morgan").await.unwrap();
+        assert_eq!(sessions.user_for(&token).await.as_deref(), Some("morgan"));
+        assert_eq!(sessions.user_for("forged").await, None);
         sessions.revoke(&token).await;
-        assert!(!sessions.is_valid(&token).await);
+        assert_eq!(sessions.user_for(&token).await, None);
     }
 }

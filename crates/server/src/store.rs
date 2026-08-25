@@ -45,6 +45,30 @@ pub struct Persisted {
     /// Per-application environment, keyed by application name.
     #[serde(default)]
     pub app_env: HashMap<String, Vec<EnvVar>>,
+
+    /// Named operator accounts, keyed by username. Replaces the single
+    /// `operator_hash` password; a legacy file is migrated on open.
+    #[serde(default)]
+    pub users: HashMap<String, UserAccount>,
+
+    /// API tokens for scripting the operator actions, keyed by token hash.
+    #[serde(default)]
+    pub api_tokens: HashMap<String, ApiTokenMeta>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserAccount {
+    pub hash: String,
+    pub admin: bool,
+    #[serde(default)]
+    pub created_unix: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApiTokenMeta {
+    pub name: String,
+    #[serde(default)]
+    pub created_unix: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -124,17 +148,39 @@ impl Store {
             .with_context(|| format!("creating data directory {}", dir.display()))?;
         let path = dir.join("digihost.json");
 
-        let loaded = match tokio::fs::read_to_string(&path).await {
+        let mut loaded: Persisted = match tokio::fs::read_to_string(&path).await {
             Ok(raw) => serde_json::from_str(&raw)
                 .with_context(|| format!("parsing {}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Persisted::default(),
             Err(e) => return Err(e).context("reading server state"),
         };
 
-        Ok(Self {
+        // Instances claimed before named accounts existed carry one shared
+        // password. It becomes the `admin` account, password unchanged, so an
+        // update never locks anyone out.
+        let migrated = if loaded.users.is_empty() {
+            if let Some(hash) = loaded.operator_hash.take() {
+                loaded.users.insert(
+                    "admin".to_string(),
+                    UserAccount { hash, admin: true, created_unix: now_unix() },
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let store = Self {
             path,
             inner: Arc::new(RwLock::new(loaded)),
-        })
+        };
+        if migrated {
+            let snapshot = clone_persisted(&*store.inner.read().await);
+            store.flush(&snapshot).await?;
+        }
+        Ok(store)
     }
 
     async fn flush(&self, data: &Persisted) -> Result<()> {
@@ -151,42 +197,160 @@ impl Store {
         Ok(())
     }
 
-    // ------------------------------------------------------------- operator
+    // ---------------------------------------------------------------- users
 
     pub async fn is_claimed(&self) -> bool {
-        self.inner.read().await.operator_hash.is_some()
+        !self.inner.read().await.users.is_empty()
     }
 
-    pub async fn set_operator_password(&self, password: &str) -> Result<()> {
-        // argon2's own salt generator sits behind an RNG feature that moved
-        // between releases; drawing the salt ourselves keeps this stable.
-        let mut salt_bytes = [0u8; 16];
-        getrandom::fill(&mut salt_bytes)
-            .map_err(|e| anyhow::anyhow!("reading system randomness: {e}"))?;
-        let salt = SaltString::encode_b64(&salt_bytes)
-            .map_err(|e| anyhow::anyhow!("encoding password salt: {e}"))?;
-        let hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| anyhow::anyhow!("hashing password: {e}"))?
-            .to_string();
+    /// Verify a login. Returns the account's admin flag on success.
+    pub async fn verify_login(&self, name: &str, password: &str) -> Option<bool> {
+        let account = self.inner.read().await.users.get(&normalise(name)).cloned()?;
+        verify_hash(&account.hash, password).then_some(account.admin)
+    }
+
+    /// A user's admin flag — None when the account no longer exists, which is
+    /// how sessions of deleted users die.
+    pub async fn user_admin(&self, name: &str) -> Option<bool> {
+        self.inner
+            .read()
+            .await
+            .users
+            .get(&normalise(name))
+            .map(|u| u.admin)
+    }
+
+    pub async fn add_user(&self, name: &str, password: &str, admin: bool) -> Result<String> {
+        let name = normalise(name);
+        if !name_ok(&name) {
+            anyhow::bail!(
+                "usernames are 1-32 lowercase letters, digits, '-', '_' or '.' — got {name:?}"
+            );
+        }
+        let hash = hash_password(password)?;
 
         let mut guard = self.inner.write().await;
-        guard.operator_hash = Some(hash);
+        if guard.users.contains_key(&name) {
+            anyhow::bail!("user {name} already exists");
+        }
+        guard.users.insert(
+            name.clone(),
+            UserAccount { hash, admin, created_unix: now_unix() },
+        );
+        let snapshot = clone_persisted(&guard);
+        drop(guard);
+        self.flush(&snapshot).await?;
+        Ok(name)
+    }
+
+    pub async fn set_user_password(&self, name: &str, password: &str) -> Result<()> {
+        let name = normalise(name);
+        let hash = hash_password(password)?;
+
+        let mut guard = self.inner.write().await;
+        let account = guard
+            .users
+            .get_mut(&name)
+            .ok_or_else(|| anyhow::anyhow!("no user named {name}"))?;
+        account.hash = hash;
         let snapshot = clone_persisted(&guard);
         drop(guard);
         self.flush(&snapshot).await
     }
 
-    pub async fn verify_operator(&self, password: &str) -> bool {
-        let Some(stored) = self.inner.read().await.operator_hash.clone() else {
-            return false;
-        };
-        let Ok(parsed) = PasswordHash::new(&stored) else {
-            return false;
-        };
-        Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok()
+    /// Remove an account — but never the last administrator, which would lock
+    /// the instance permanently.
+    pub async fn remove_user(&self, name: &str) -> Result<()> {
+        let name = normalise(name);
+        let mut guard = self.inner.write().await;
+        let target = guard
+            .users
+            .get(&name)
+            .ok_or_else(|| anyhow::anyhow!("no user named {name}"))?;
+        if target.admin {
+            let admins = guard.users.values().filter(|u| u.admin).count();
+            if admins <= 1 {
+                anyhow::bail!("cannot remove the last administrator");
+            }
+        }
+        guard.users.remove(&name);
+        let snapshot = clone_persisted(&guard);
+        drop(guard);
+        self.flush(&snapshot).await
+    }
+
+    /// (name, admin, created) sorted by name.
+    pub async fn users(&self) -> Vec<(String, bool, u64)> {
+        let mut out: Vec<(String, bool, u64)> = self
+            .inner
+            .read()
+            .await
+            .users
+            .iter()
+            .map(|(n, u)| (n.clone(), u.admin, u.created_unix))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    // ----------------------------------------------------------- API tokens
+
+    /// Mint a named API token. The token itself is returned exactly once;
+    /// only its hash is stored.
+    pub async fn mint_api_token(&self, name: &str) -> Result<String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("give the token a name so it can be recognised later");
+        }
+        let mut guard = self.inner.write().await;
+        if guard.api_tokens.values().any(|t| t.name == name) {
+            anyhow::bail!("a token named {name} already exists");
+        }
+        let token = generate_token()?;
+        guard.api_tokens.insert(
+            hash_token(&token),
+            ApiTokenMeta { name, created_unix: now_unix() },
+        );
+        let snapshot = clone_persisted(&guard);
+        drop(guard);
+        self.flush(&snapshot).await?;
+        Ok(token)
+    }
+
+    /// The name behind a presented API token, if it is valid.
+    pub async fn api_token_name(&self, token: &str) -> Option<String> {
+        self.inner
+            .read()
+            .await
+            .api_tokens
+            .get(&hash_token(token))
+            .map(|t| t.name.clone())
+    }
+
+    pub async fn revoke_api_token(&self, name: &str) -> Result<()> {
+        let mut guard = self.inner.write().await;
+        let before = guard.api_tokens.len();
+        guard.api_tokens.retain(|_, t| t.name != name);
+        if guard.api_tokens.len() == before {
+            anyhow::bail!("no token named {name}");
+        }
+        let snapshot = clone_persisted(&guard);
+        drop(guard);
+        self.flush(&snapshot).await
+    }
+
+    /// (name, created) sorted newest first.
+    pub async fn api_tokens(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = self
+            .inner
+            .read()
+            .await
+            .api_tokens
+            .values()
+            .map(|t| (t.name.clone(), t.created_unix))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
     }
 
     // --------------------------------------------------------------- GitHub
@@ -306,7 +470,51 @@ fn clone_persisted(data: &Persisted) -> Persisted {
         agent_tokens: data.agent_tokens.clone(),
         pending_enrollments: data.pending_enrollments.clone(),
         app_env: data.app_env.clone(),
+        users: data.users.clone(),
+        api_tokens: data.api_tokens.clone(),
     }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn normalise(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+}
+
+fn hash_password(password: &str) -> Result<String> {
+    // argon2's own salt generator sits behind an RNG feature that moved
+    // between releases; drawing the salt ourselves keeps this stable.
+    let mut salt_bytes = [0u8; 16];
+    getrandom::fill(&mut salt_bytes)
+        .map_err(|e| anyhow::anyhow!("reading system randomness: {e}"))?;
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|e| anyhow::anyhow!("encoding password salt: {e}"))?;
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("hashing password: {e}"))?
+        .to_string())
+}
+
+fn verify_hash(stored: &str, password: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 /// 256 bits of OS randomness, URL-safe so it drops into a shell command.
@@ -403,15 +611,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_password_round_trips() {
-        let dir = scratch_dir("pass");
+    async fn users_round_trip_and_the_last_admin_is_protected() {
+        let dir = scratch_dir("users");
         let store = Store::open(&dir).await.unwrap();
 
         assert!(!store.is_claimed().await);
-        store.set_operator_password("correct horse battery").await.unwrap();
+        store.add_user("Morgan", "a fine long password", true).await.unwrap();
         assert!(store.is_claimed().await);
-        assert!(store.verify_operator("correct horse battery").await);
-        assert!(!store.verify_operator("wrong").await);
+
+        // Names normalise to lowercase on the way in and on lookup.
+        assert_eq!(store.verify_login("morgan", "a fine long password").await, Some(true));
+        assert_eq!(store.verify_login("MORGAN", "a fine long password").await, Some(true));
+        assert_eq!(store.verify_login("morgan", "wrong").await, None);
+
+        assert!(store.add_user("morgan", "x", false).await.is_err(), "no duplicates");
+        assert!(store.add_user("Bad Name!", "irrelevant password", false).await.is_err());
+
+        store.add_user("crew", "another long password", false).await.unwrap();
+        assert_eq!(store.verify_login("crew", "another long password").await, Some(false));
+
+        store.set_user_password("crew", "rotated password now").await.unwrap();
+        assert_eq!(store.verify_login("crew", "another long password").await, None);
+        assert_eq!(store.verify_login("crew", "rotated password now").await, Some(false));
+
+        assert!(
+            store.remove_user("morgan").await.is_err(),
+            "the last administrator must be unremovable"
+        );
+        store.remove_user("crew").await.unwrap();
+        assert_eq!(store.users().await.len(), 1);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_single_password_becomes_the_admin_account() {
+        let dir = scratch_dir("migrate");
+        {
+            let store = Store::open(&dir).await.unwrap();
+            // Simulate a pre-accounts install: hash written straight into the
+            // legacy field, no users.
+            let hash = hash_password("the original password").unwrap();
+            let mut guard = store.inner.write().await;
+            guard.users.clear();
+            guard.operator_hash = Some(hash);
+            let snapshot = clone_persisted(&guard);
+            drop(guard);
+            store.flush(&snapshot).await.unwrap();
+        }
+
+        let store = Store::open(&dir).await.unwrap();
+        assert!(store.is_claimed().await);
+        assert_eq!(
+            store.verify_login("admin", "the original password").await,
+            Some(true),
+            "the old password must keep working, as admin"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn api_tokens_mint_resolve_and_revoke() {
+        let dir = scratch_dir("apitok");
+        let store = Store::open(&dir).await.unwrap();
+
+        let token = store.mint_api_token("ci-deploys").await.unwrap();
+        assert!(store.mint_api_token("ci-deploys").await.is_err(), "names are unique");
+        assert_eq!(store.api_token_name(&token).await.as_deref(), Some("ci-deploys"));
+        assert_eq!(store.api_token_name("forged").await, None);
+
+        store.revoke_api_token("ci-deploys").await.unwrap();
+        assert_eq!(store.api_token_name(&token).await, None, "revoked means gone");
+        assert!(store.revoke_api_token("ci-deploys").await.is_err());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -440,11 +712,11 @@ mod tests {
         let dir = scratch_dir("reopen");
         {
             let store = Store::open(&dir).await.unwrap();
-            store.set_operator_password("a durable password!").await.unwrap();
+            store.add_user("keeper", "a durable password!", true).await.unwrap();
             store.set_env("app", parse_env("K=v", true).unwrap()).await.unwrap();
         }
         let store = Store::open(&dir).await.unwrap();
-        assert!(store.verify_operator("a durable password!").await);
+        assert_eq!(store.verify_login("keeper", "a durable password!").await, Some(true));
         assert_eq!(store.env_for("app").await.len(), 1);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

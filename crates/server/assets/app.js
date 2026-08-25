@@ -222,6 +222,20 @@
       btn.addEventListener('click', () => btn.closest('dialog')?.close());
     });
 
+    // "Reset password" buttons open one shared dialog aimed at their user.
+    $$('[data-reset-user]', root).forEach((btn) => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', () => {
+        const dlg = document.getElementById('dlg-reset');
+        if (!dlg) return;
+        dlg.querySelector('[name="user"]').value = btn.dataset.resetUser;
+        const label = dlg.querySelector('[data-reset-label]');
+        if (label) label.textContent = btn.dataset.resetUser;
+        dlg.showModal();
+      });
+    });
+
     $$('[data-detect]', root).forEach((btn) => {
       if (btn.dataset.wired) return;
       btn.dataset.wired = '1';

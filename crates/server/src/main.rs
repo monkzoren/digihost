@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -34,7 +34,7 @@ use futures::stream::Stream;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 use tokio::sync::broadcast;
 
-use api::Sessions;
+use api::{CurrentUser, Sessions};
 use github::GitHub;
 use module_bindings::{
     application_table::ApplicationTableAccess, deploy_log_line_table::DeployLogLineTableAccess,
@@ -321,7 +321,10 @@ impl AppState {
     }
 }
 
-async fn index(State(state): State<AppState>) -> Html<String> {
+async fn index(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Html<String> {
     let snap = state.snapshot();
     Html(
         view::page(
@@ -333,12 +336,16 @@ async fn index(State(state): State<AppState>) -> Html<String> {
             state.github.app_configured(),
             SERVER_VERSION,
             state.update_available().await.as_deref(),
+            &user.name,
         )
         .into_string(),
     )
 }
 
-async fn applications(State(state): State<AppState>) -> Html<String> {
+async fn applications(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Html<String> {
     let snap = state.snapshot();
     Html(
         view::applications_page(
@@ -351,6 +358,47 @@ async fn applications(State(state): State<AppState>) -> Html<String> {
             state.github.app_configured(),
             SERVER_VERSION,
             state.update_available().await.as_deref(),
+            &user.name,
+        )
+        .into_string(),
+    )
+}
+
+async fn team(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Html<String> {
+    let snap = state.snapshot();
+    Html(
+        view::team_page(
+            &snap,
+            &state.instance,
+            state.github.app_configured(),
+            SERVER_VERSION,
+            state.update_available().await.as_deref(),
+            &user.name,
+            user.admin,
+            &state.store.users().await,
+        )
+        .into_string(),
+    )
+}
+
+async fn tokens(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Html<String> {
+    let snap = state.snapshot();
+    Html(
+        view::tokens_page(
+            &snap,
+            &state.instance,
+            state.github.app_configured(),
+            SERVER_VERSION,
+            state.update_available().await.as_deref(),
+            &user.name,
+            user.admin,
+            &state.store.api_tokens().await,
         )
         .into_string(),
     )
@@ -562,6 +610,8 @@ async fn main() -> Result<()> {
     let protected = Router::new()
         .route("/", get(index))
         .route("/applications", get(applications))
+        .route("/settings/team", get(team))
+        .route("/settings/tokens", get(tokens))
         .route("/events", get(events))
         .route("/deployments/{deployment_id}/log", get(deployment_log))
         .route("/logout", post(api::logout))
@@ -576,6 +626,12 @@ async fn main() -> Result<()> {
         .route("/actions/github/disconnect", post(api::disconnect_github))
         .route("/actions/env", post(api::set_env))
         .route("/actions/env/unset", post(api::unset_env))
+        .route("/actions/team/add", post(api::team_add))
+        .route("/actions/team/reset", post(api::team_reset))
+        .route("/actions/team/remove", post(api::team_remove))
+        .route("/actions/password", post(api::change_password))
+        .route("/actions/tokens/mint", post(api::token_mint))
+        .route("/actions/tokens/revoke", post(api::token_revoke))
         .route("/actions/repos", get(api::list_repos))
         .route("/actions/detect", post(api::detect))
         .layer(middleware::from_fn_with_state(state.clone(), api::require_operator));

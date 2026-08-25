@@ -463,8 +463,8 @@ const NAV: &[NavGroup] = &[
         colour: "#fb923c",
         icon: icon::sliders,
         items: &[
-            NavItem { id: "team", label: "Team", href: None, icon: icon::users },
-            NavItem { id: "tokens", label: "API tokens", href: None, icon: icon::key },
+            NavItem { id: "team", label: "Team", href: Some("/settings/team"), icon: icon::users },
+            NavItem { id: "tokens", label: "API tokens", href: Some("/settings/tokens"), icon: icon::key },
         ],
     },
 ];
@@ -511,6 +511,7 @@ fn sidebar(
     active: &str,
     version: &str,
     update: Option<&str>,
+    user: &str,
 ) -> Markup {
     html! {
         aside class="sidebar" {
@@ -550,7 +551,7 @@ fn sidebar(
                         "v" (latest) " available — run digihost-update"
                     }
                 }
-                p class="version" { "DigiHost v" (version) }
+                p class="version" { (user) " · DigiHost v" (version) }
             }
         }
     }
@@ -845,7 +846,14 @@ pub fn login(instance: &str, setup: bool) -> Markup {
                         }
                         form method="post" action=(if setup { "/setup" } else { "/login" }) class="stack" {
                             label class="field" {
-                                span { "Operator password" }
+                                span { "Username" }
+                                input type="text" name="username" required
+                                    placeholder=(if setup { "admin" } else { "" })
+                                    value=(if setup { "admin" } else { "" })
+                                    autocomplete="username";
+                            }
+                            label class="field" {
+                                span { "Password" }
                                 input type="password" name="password" required
                                     autocomplete=(if setup { "new-password" } else { "current-password" });
                             }
@@ -860,6 +868,252 @@ pub fn login(instance: &str, setup: bool) -> Markup {
     }
 }
 
+
+/// A settings-page shell: sidebar plus one content column.
+#[allow(clippy::too_many_arguments)]
+fn settings_shell(
+    title: &str,
+    active: &str,
+    snap: &FleetSnapshot,
+    instance: &str,
+    github_ok: bool,
+    version: &str,
+    update: Option<&str>,
+    user: &str,
+    content: Markup,
+) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            (head(title))
+            body {
+                div class="shell" {
+                    (sidebar(snap, instance, github_ok, active, version, update, user))
+                    main class="main" { (content) }
+                }
+                script { (PreEscaped(APP_JS)) }
+            }
+        }
+    }
+}
+
+fn ago(created_unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = now.saturating_sub(created_unix) / 86_400;
+    match days {
+        0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        n => format!("{n} days ago"),
+    }
+}
+
+/// The Team page: the accounts that can operate this instance.
+#[allow(clippy::too_many_arguments)]
+pub fn team_page(
+    snap: &FleetSnapshot,
+    instance: &str,
+    github_ok: bool,
+    version: &str,
+    update: Option<&str>,
+    user: &str,
+    is_admin: bool,
+    members: &[(String, bool, u64)],
+) -> Markup {
+    let content = html! {
+        div class="page-head" {
+            div {
+                h1 { "Team" }
+                div class="page-sub" {
+                    span {
+                        (members.len())
+                        (if members.len() == 1 { " member" } else { " members" })
+                        " · every member can operate the fleet; administrators also manage this page"
+                    }
+                }
+            }
+            @if is_admin {
+                div class="actions" {
+                    button class="btn btn-primary" data-open="dlg-add-user" {
+                        (icon::plus(16)) "Add member"
+                    }
+                }
+            }
+        }
+
+        div class="panel table" {
+            div class="tr thead" {
+                div class="c-host" { "Member" }
+                div class="c-platform" { "Role" }
+                div class="c-when" { "Added" }
+                div class="c-actions" style="width:220px;flex-basis:220px" {}
+            }
+            @for (name, admin, created) in members {
+                div class="tr" {
+                    div class="c-host" {
+                        div class="cell-title" { (name) }
+                        @if name == user { div class="cell-sub" { "you" } }
+                    }
+                    div class="c-platform" {
+                        @if *admin { span class="pill info" { "Administrator" } }
+                        @else { span class="pill idle" { "Operator" } }
+                    }
+                    div class="c-when" { (ago(*created)) }
+                    div class="c-actions" style="width:220px;flex-basis:220px;gap:8px" {
+                        @if is_admin {
+                            button class="ghost" data-reset-user=(name) { "Reset password" }
+                            @if name != user {
+                                button class="ghost" data-action="/actions/team/remove"
+                                    data-field-user=(name)
+                                    data-confirm=(format!("Remove {name}? Their sessions end immediately.")) {
+                                    "Remove"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        div class="panel" style="padding:24px;max-width:480px" {
+            div class="stack" {
+                h2 { "Your password" }
+                label class="field" {
+                    span { "Current password" }
+                    input type="password" name="current" autocomplete="current-password";
+                }
+                label class="field" {
+                    span { "New password" }
+                    input type="password" name="password" autocomplete="new-password";
+                }
+                div class="dlg-actions" style="justify-content:flex-start" {
+                    button class="btn btn-primary" data-action="/actions/password" { "Change password" }
+                }
+            }
+        }
+
+        @if is_admin {
+            dialog id="dlg-add-user" {
+                div class="stack" {
+                    h2 { "Add a member" }
+                    label class="field" {
+                        span { "Username" }
+                        input type="text" name="username" placeholder="lowercase, digits, - _ ." required;
+                    }
+                    label class="field" {
+                        span { "Password" }
+                        input type="password" name="password" placeholder="at least 12 characters" required;
+                    }
+                    label class="check" {
+                        input type="checkbox" name="admin" value="1";
+                        span { "Administrator — can manage members and API tokens" }
+                    }
+                    div class="dlg-actions" {
+                        button class="btn btn-outline" data-close { "Cancel" }
+                        button class="btn btn-primary" data-action="/actions/team/add" { "Add" }
+                    }
+                }
+            }
+
+            dialog id="dlg-reset" {
+                div class="stack" {
+                    h2 { "Reset password" }
+                    p class="gate-note" {
+                        "Sets a new password for " span data-reset-label class="mono" { "…" } "."
+                    }
+                    input type="hidden" name="user" value="";
+                    label class="field" {
+                        span { "New password" }
+                        input type="password" name="password" placeholder="at least 12 characters" required;
+                    }
+                    div class="dlg-actions" {
+                        button class="btn btn-outline" data-close { "Cancel" }
+                        button class="btn btn-primary" data-action="/actions/team/reset" { "Set password" }
+                    }
+                }
+            }
+        }
+    };
+    settings_shell("Team · DigiHost", "team", snap, instance, github_ok, version, update, user, content)
+}
+
+/// The API tokens page: bearer tokens for scripting the operator actions.
+#[allow(clippy::too_many_arguments)]
+pub fn tokens_page(
+    snap: &FleetSnapshot,
+    instance: &str,
+    github_ok: bool,
+    version: &str,
+    update: Option<&str>,
+    user: &str,
+    is_admin: bool,
+    tokens: &[(String, u64)],
+) -> Markup {
+    let content = html! {
+        div class="page-head" {
+            div {
+                h1 { "API tokens" }
+                div class="page-sub" {
+                    span {
+                        "Bearer tokens for scripting the action endpoints — "
+                        span class="mono" { "Authorization: Bearer <token>" }
+                        ". Tokens deploy and operate; they cannot manage accounts."
+                    }
+                }
+            }
+        }
+
+        @if is_admin {
+            div class="panel" style="padding:24px;max-width:560px" {
+                div class="stack" {
+                    h2 { "Mint a token" }
+                    label class="field" {
+                        span { "Name" }
+                        input type="text" name="name" placeholder="ci-deploys" required;
+                    }
+                    div class="dlg-actions" style="justify-content:flex-start" {
+                        button class="btn btn-primary" data-action="/actions/tokens/mint"
+                            data-result="#token-result" { "Mint" }
+                    }
+                    pre id="token-result" class="result hidden" {}
+                }
+            }
+        }
+
+        div class="panel table" {
+            div class="tr thead" {
+                div class="c-host" { "Token" }
+                div class="c-when" { "Created" }
+                div class="c-actions" {}
+            }
+            @for (name, created) in tokens {
+                div class="tr" {
+                    div class="c-host" { div class="cell-title" { (name) } }
+                    div class="c-when" { (ago(*created)) }
+                    div class="c-actions" {
+                        @if is_admin {
+                            button class="ghost" data-action="/actions/tokens/revoke"
+                                data-field-name=(name)
+                                data-confirm=(format!("Revoke {name}? Anything using it stops working immediately.")) {
+                                "Revoke"
+                            }
+                        }
+                    }
+                }
+            }
+            @if tokens.is_empty() {
+                div class="empty" {
+                    p class="empty-title" { "No tokens" }
+                    p class="empty-body" { "Mint one to script deployments from CI or the shell." }
+                }
+            }
+        }
+    };
+    settings_shell("API tokens · DigiHost", "tokens", snap, instance, github_ok, version, update, user, content)
+}
+
 /// The Fleet page.
 #[allow(clippy::too_many_arguments)]
 pub fn page(
@@ -871,6 +1125,7 @@ pub fn page(
     github_ok: bool,
     version: &str,
     update: Option<&str>,
+    user: &str,
 ) -> Markup {
     html! {
         (DOCTYPE)
@@ -878,7 +1133,7 @@ pub fn page(
             (head("Fleet · DigiHost"))
             body {
                 div class="shell" {
-                    (sidebar(snap, instance, github_ok, "fleet", version, update))
+                    (sidebar(snap, instance, github_ok, "fleet", version, update, user))
 
                     main class="main" {
                         div class="page-head" {
@@ -928,6 +1183,7 @@ pub fn applications_page(
     github_ok: bool,
     version: &str,
     update: Option<&str>,
+    user: &str,
 ) -> Markup {
     html! {
         (DOCTYPE)
@@ -935,7 +1191,7 @@ pub fn applications_page(
             (head("Applications · DigiHost"))
             body {
                 div class="shell" {
-                    (sidebar(snap, instance, github_ok, "applications", version, update))
+                    (sidebar(snap, instance, github_ok, "applications", version, update, user))
 
                     main class="main" {
                         div class="page-head" {
