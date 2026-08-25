@@ -1,0 +1,8 @@
+/target
+/crates/module/target
+/.digihost
+/.digihost-agent
+# Local editor/session config and the site-specific runbook stay out of the
+# public repository.
+/.claude/
+MIGRATION.md

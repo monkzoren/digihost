@@ -1,0 +1,73 @@
+# Builds release artifacts whenever a v* tag is pushed, and attaches them to a
+# GitHub release. digihost-update on an installed server consumes exactly
+# these artifacts.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build binaries
+        run: cargo build --release -p digihost-server -p digihost-agent
+
+      - name: Build control-plane module
+        working-directory: crates/module
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build --release --target wasm32-unknown-unknown
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/digihost-server target/release/digihost-agent dist/
+          cp crates/module/target/wasm32-unknown-unknown/release/digihost_module.wasm dist/
+          cp deploy/update.sh dist/update.sh
+          tar -C dist -czf digihost-linux-x86_64.tar.gz \
+            digihost-server digihost-agent digihost_module.wasm update.sh
+          sha256sum digihost-linux-x86_64.tar.gz > digihost-linux-x86_64.tar.gz.sha256
+
+      - name: Create release and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "DigiHost ${{ github.ref_name }}" \
+            --notes "Automated release build. Linux servers update with \`digihost-update\`." \
+            || true
+          gh release upload "${{ github.ref_name }}" \
+            digihost-linux-x86_64.tar.gz digihost-linux-x86_64.tar.gz.sha256 --clobber
+
+  windows:
+    runs-on: windows-latest
+    needs: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build binaries
+        run: cargo build --release -p digihost-server -p digihost-agent
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/digihost-server.exe, target/release/digihost-agent.exe dist/
+          Compress-Archive -Path dist/* -DestinationPath digihost-windows-x86_64.zip
+          $h = (Get-FileHash digihost-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$h  digihost-windows-x86_64.zip" | Out-File -Encoding ascii digihost-windows-x86_64.zip.sha256
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release upload "${{ github.ref_name }}" `
+            digihost-windows-x86_64.zip digihost-windows-x86_64.zip.sha256 --clobber

@@ -1,0 +1,18 @@
+# Detached from the root workspace: this crate is a SpacetimeDB module and
+# targets wasm32-unknown-unknown.
+[workspace]
+
+[package]
+name = "digihost-module"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned to the installed CLI version: the API drifts between 2.x minors
+# (ctx.sender became a method, index syntax changed), so cargo must not
+# resolve a newer crate than the server we publish to.
+spacetimedb = { version = "=2.0.2" }
+log = "0.4"

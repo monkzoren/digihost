@@ -1,0 +1,19 @@
+[package]
+name = "digihost-agent"
+description = "DigiHost host agent: enrols a Linux or Windows server and deploys to it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spacetimedb-sdk.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+sysinfo = "0.39"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
+flate2 = "1"
+tar = "0.4"

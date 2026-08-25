@@ -1,0 +1,27 @@
+[package]
+name = "digihost-server"
+description = "DigiHost server: web interface, GitHub broker, agent API, control plane host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spacetimedb-sdk.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "fs"] }
+maud = "0.27"
+futures = "0.3"
+async-stream = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+jsonwebtoken = "11"
+sha2 = "0.11"
+hmac = "0.13"
+base64 = "0.23"
+argon2 = "0.5"
+getrandom = "0.4"
