@@ -223,6 +223,18 @@ instead of limping on mismatched.
 Windows agents update by replacing `digihost-agent.exe` from the
 `digihost-windows-x86_64.zip` release asset and restarting the process.
 
+## Cutting a release
+
+```bash
+deploy/release.sh --patch --deploy
+```
+
+The release tool refuses a dirty tree or an out-of-sync main, runs the test
+suite before touching anything, bumps the workspace and module versions, tags,
+pushes, waits for CI to publish the Linux artifact, and — with `--deploy` —
+runs `digihost-update` on `$DIGIHOST_DEPLOY_HOST` (set it in a gitignored
+`.release.env`). `--minor`, `--major` or an explicit version work too.
+
 ## Version pinning
 
 The `spacetimedb` crate is pinned to the exact CLI version (`=2.0.2`). Cargo

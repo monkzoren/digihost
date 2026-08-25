@@ -6,3 +6,4 @@
 # public repository.
 /.claude/
 MIGRATION.md
+.release.env
