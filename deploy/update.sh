@@ -16,12 +16,12 @@ FORCE=0
 
 current="$("$DIR/bin/digihost-server" --version 2>/dev/null | awk '{print $2}' || echo 0.0.0)"
 tag="$(curl -fsSL -H 'User-Agent: digihost-update' \
-  "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep -m1 '"tag_name"' | cut -d '"' -f4)"
+  "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+  | grep -m1 '"tag_name"' | cut -d '"' -f4 || true)"
 latest="${tag#v}"
 
 if [ -z "$tag" ]; then
-  echo "could not read the latest release of $REPO" >&2
+  echo "no published release found for $REPO (yet?)" >&2
   exit 1
 fi
 if [ "$current" = "$latest" ] && [ "$FORCE" = 0 ]; then
