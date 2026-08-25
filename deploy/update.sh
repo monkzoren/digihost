@@ -17,7 +17,7 @@ FORCE=0
 current="$("$DIR/bin/digihost-server" --version 2>/dev/null | awk '{print $2}' || echo 0.0.0)"
 tag="$(curl -fsSL -H 'User-Agent: digihost-update' \
   "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-  | grep -m1 '"tag_name"' | cut -d '"' -f4 || true)"
+  | tr ',' '\n' | grep -m1 '"tag_name"' | cut -d '"' -f4 || true)"
 latest="${tag#v}"
 
 if [ -z "$tag" ]; then
